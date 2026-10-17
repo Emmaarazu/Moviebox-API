@@ -1,13 +1,15 @@
 """
-Live verification for MovieBox API Pro.
-Chains requests: uses a real slug from /home to test /detail and /api/stream.
+Live verification for MovieBox API Pro v2.3.3.
+Chains requests: uses a real slug from /home to test /detail, /api/stream,
+the Range-aware stream proxy, the SRT -> VTT converter, and the
+home-section catalog fallback.
 Run against a live server: python verify.py [base_url]
 """
 import sys
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-TIMEOUT = 30
+TIMEOUT = 90
 
 
 def hr(label):
@@ -42,7 +44,8 @@ def record(passed):
 hr("GET /  (dashboard)")
 try:
     r = httpx.get(f"{BASE}/", timeout=TIMEOUT)
-    record(ok(r.status_code == 200 and "<html" in r.text.lower(), f"status {r.status_code}, html present"))
+    is_html = r.status_code == 200 and "<html" in r.text.lower()
+    record(ok(is_html, f"status {r.status_code}, html={'YES' if is_html else 'NO'}"))
 except Exception as e:
     record(ok(False, f"exception: {e}"))
 
@@ -65,20 +68,57 @@ try:
 except Exception as e:
     record(ok(False, f"exception: {e}"))
 
-# ── 3. catalogs ────────────────────────────────────────────────────────────
+# ── 3. aggregate home ──────────────────────────────────────────────────────
+hr("GET /home/all")
+try:
+    r = httpx.get(f"{BASE}/home/all", timeout=TIMEOUT)
+    data = r.json()
+    items = data.get("items", [])
+    record(ok(r.status_code == 200 and len(items) > 0, f"status {r.status_code}, count={data.get('count')}"))
+    sample_items(items, "aggregate")
+except Exception as e:
+    record(ok(False, f"exception: {e}"))
+
+# ── 4. sections ────────────────────────────────────────────────────────────
+hr("GET /sections")
+try:
+    r = httpx.get(f"{BASE}/sections", timeout=TIMEOUT)
+    data = r.json()
+    secs = data.get("sections", [])
+    record(ok(r.status_code == 200 and len(secs) > 0, f"status {r.status_code}, {len(secs)} sections"))
+    for s in secs[:6]:
+        print(f"    {s['type']:20} {s['section']!r:40} count={s['count']}")
+except Exception as e:
+    record(ok(False, f"exception: {e}"))
+
+# ── 5. browse a real section ───────────────────────────────────────────────
+hr("GET /browse/Cinema")
+try:
+    r = httpx.get(f"{BASE}/browse/Cinema", timeout=TIMEOUT)
+    data = r.json()
+    items = data.get("items", [])
+    record(ok(r.status_code == 200 and len(items) > 0,
+              f"status {r.status_code}, total={data.get('total')}, matched={data.get('matched_titles')}"))
+    sample_items(items, "browse")
+except Exception as e:
+    record(ok(False, f"exception: {e}"))
+
+# ── 6. catalogs (auto fallback) ────────────────────────────────────────────
 for path in ("/movies", "/tv-series", "/animation"):
     hr(f"GET {path}")
     try:
         r = httpx.get(f"{BASE}{path}", timeout=TIMEOUT)
         data = r.json()
         items = data.get("items", [])
+        source = data.get("source")
+        sentinel = data.get("total_sentinel")
         record(ok(r.status_code == 200 and len(items) > 0,
-                  f"status {r.status_code}, page={data.get('page')}, total={data.get('total')}"))
+                  f"status {r.status_code}, source={source}, total={data.get('total')} sentinel={sentinel}"))
         sample_items(items, path)
     except Exception as e:
         record(ok(False, f"exception: {e}"))
 
-# ── 4. search ──────────────────────────────────────────────────────────────
+# ── 7. search ──────────────────────────────────────────────────────────────
 hr("GET /search?q=matrix")
 try:
     r = httpx.get(f"{BASE}/search", params={"q": "matrix"}, timeout=TIMEOUT)
@@ -89,7 +129,7 @@ try:
 except Exception as e:
     record(ok(False, f"exception: {e}"))
 
-# ── 5. suggest ─────────────────────────────────────────────────────────────
+# ── 8. suggest ─────────────────────────────────────────────────────────────
 hr("GET /search/suggest?q=break")
 try:
     r = httpx.get(f"{BASE}/search/suggest", params={"q": "break"}, timeout=TIMEOUT)
@@ -98,10 +138,12 @@ try:
     record(ok(r.status_code == 200, f"status {r.status_code}, {len(sugg)} suggestions"))
     if sugg:
         print(f"    sample: {sugg[0]}")
+        with_slug = sum(1 for s in sugg if s.get("slug"))
+        print(f"    with_slug={with_slug}/{len(sugg)}  (expected 0 unless enrich=1)")
 except Exception as e:
     record(ok(False, f"exception: {e}"))
 
-# ── 6. detail ──────────────────────────────────────────────────────────────
+# ── 9. detail ──────────────────────────────────────────────────────────────
 hr("GET /detail/{slug}")
 if home_slug:
     try:
@@ -114,7 +156,7 @@ if home_slug:
 else:
     record(ok(False, "no slug from /home to test with"))
 
-# ── 7. stream ──────────────────────────────────────────────────────────────
+# ── 10. stream ─────────────────────────────────────────────────────────────
 hr("GET /api/stream/{sid}")
 if home_sid and home_slug:
     try:
@@ -134,8 +176,9 @@ if home_sid and home_slug:
 else:
     record(ok(False, "no subject_id from /home to test with"))
 
-# ── 8. captions ────────────────────────────────────────────────────────────
+# ── 11. captions ───────────────────────────────────────────────────────────
 hr("GET /api/stream/{sid}/captions")
+captions_lang = None
 if home_sid and home_slug:
     try:
         r = httpx.get(
@@ -147,18 +190,83 @@ if home_sid and home_slug:
         caps = data.get("captions", [])
         record(ok(r.status_code == 200, f"status {r.status_code}, count={data.get('count')}"))
         if caps:
-            print(f"    first: {caps[0]}")
+            captions_lang = caps[0].get("lan")
+            print(f"    first lang: {captions_lang}")
     except Exception as e:
         record(ok(False, f"exception: {e}"))
 else:
     record(ok(False, "no subject_id from /home to test with"))
 
-# ── 9. health ──────────────────────────────────────────────────────────────
+# ── 12. stream proxy ───────────────────────────────────────────────────────
+hr("GET /api/stream/{sid}/proxy  (Range: bytes=0-1023)")
+if home_sid and home_slug:
+    try:
+        with httpx.stream(
+            "GET",
+            f"{BASE}/api/stream/{home_sid}/proxy",
+            params={"detail_path": home_slug, "res": "best"},
+            headers={"Range": "bytes=0-1023"},
+            timeout=TIMEOUT,
+        ) as r:
+            first = b""
+            for chunk in r.iter_bytes(1024):
+                first = chunk
+                break
+            ct = r.headers.get("content-type", "")
+            record(ok(r.status_code in (200, 206) and len(first) > 0,
+                      f"status {r.status_code}, {len(first)} bytes, ct={ct}"))
+    except Exception as e:
+        record(ok(False, f"exception: {e}"))
+else:
+    record(ok(False, "no subject_id from /home to test with"))
+
+# ── 13. subtitles VTT ──────────────────────────────────────────────────────
+hr("GET /api/stream/{sid}/subtitles/{lang}")
+if home_sid and home_slug and captions_lang:
+    try:
+        r = httpx.get(
+            f"{BASE}/api/stream/{home_sid}/subtitles/{captions_lang}",
+            params={"detail_path": home_slug},
+            timeout=TIMEOUT,
+        )
+        starts_vtt = r.text.startswith("WEBVTT")
+        record(ok(r.status_code == 200 and starts_vtt,
+                  f"status {r.status_code}, lang={captions_lang}, {len(r.text)} bytes, WEBVTT={starts_vtt}"))
+    except Exception as e:
+        record(ok(False, f"exception: {e}"))
+elif home_sid and home_slug:
+    record(ok(True, "no captions to test with (skip)"))
+else:
+    record(ok(False, "no subject_id from /home to test with"))
+
+# ── 14. tab variants ───────────────────────────────────────────────────────
+hr("GET /api/tabs/variants?tab_id=2")
+try:
+    r = httpx.get(f"{BASE}/api/tabs/variants", params={"tab_id": 2}, timeout=TIMEOUT)
+    data = r.json()
+    variants = data.get("variants", [])
+    record(ok(r.status_code == 200, f"status {r.status_code}, {len(variants)} variants tested"))
+    for v in variants:
+        if v.get("error"):
+            print(f"    {v['variant']:15} ERROR")
+            continue
+        print(f"    {v['variant']:15} count={v['count']:>2} "
+              f"total={v['pager_total']} sentinel={v['sentinel']}")
+    breaking = data.get("non_sentinel_variants", [])
+    if breaking:
+        print(f"    BREAKING VARIANTS: {breaking}")
+    else:
+        print(f"    all variants sentinel — /subject/filter requires auth as guest (expected)")
+except Exception as e:
+    record(ok(False, f"exception: {e}"))
+
+# ── 15. health ─────────────────────────────────────────────────────────────
 hr("GET /health")
 try:
     r = httpx.get(f"{BASE}/health", timeout=TIMEOUT)
     data = r.json()
-    record(ok(r.status_code == 200 and data.get("status") == "ok", f"{data}"))
+    record(ok(r.status_code == 200 and data.get("status") == "ok",
+              f"version={data.get('version')} token_cached={data.get('token_cached')} tabs={data.get('tabs')}"))
 except Exception as e:
     record(ok(False, f"exception: {e}"))
 

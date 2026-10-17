@@ -2,30 +2,33 @@ import os
 import re
 import json
 import time
+import asyncio
+from contextlib import asynccontextmanager
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
-app = FastAPI(
-    title="MovieBox API Pro",
-    description="Full Pure REST API for moviebox.ph — Zero Scraping",
-    version="2.2.0",
-)
+API_VERSION = "2.3.3"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+PORT = int(os.environ.get("PORT", "8000"))
+REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "25"))
+RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
+RETRY_BACKOFF = float(os.environ.get("RETRY_BACKOFF", "0.5"))
+DOMAIN_TTL = int(os.environ.get("DOMAIN_TTL", "300"))
+
+TAB_MOVIES = int(os.environ.get("TAB_MOVIES", "2"))
+TAB_TV = int(os.environ.get("TAB_TV", "5"))
+TAB_ANIMATION = int(os.environ.get("TAB_ANIMATION", "8"))
 
 BASE_URL = "https://moviebox.ph"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
 
+_client: httpx.AsyncClient | None = None
 _bearer_token: str | None = None
+_token_acquired_at: float = 0.0
+_token_lock = asyncio.Lock()
 _domain_cache: dict = {"value": None, "expires": 0.0}
-DOMAIN_TTL = 300  # seconds
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
@@ -59,24 +62,90 @@ PLAYER_HEADERS = {
     "sec-fetch-site": "same-origin",
 }
 
+CATALOG_SECTIONS = {
+    "movies": ["Cinema", "Bollywood", "Hollywood", "South Indian"],
+    "tv-series": ["Hot Short TV", "Indian Drama", "Western TV", "Best Asian Series"],
+    "animation": ["Top Anime"],
+}
+
+TAB_PAYLOAD_VARIANTS = {
+    "baseline":       {"filter": {"sort": "RECOMMEND", "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}},
+    "no_filter":      None,
+    "empty_filter":   {"filter": {}},
+    "sort_only":      {"filter": {"sort": "RECOMMEND"}},
+    "sort_newest":    {"filter": {"sort": "NEWEST", "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}},
+    "sort_hot":       {"filter": {"sort": "HOT", "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}},
+    "sort_rating":    {"filter": {"sort": "RATING", "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}},
+    "type_movie":     {"filter": {"sort": "RECOMMEND", "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL", "type": "MOVIE"}},
+    "type_series":    {"filter": {"sort": "RECOMMEND", "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL", "type": "TV_SERIES"}},
+}
+
+# ─── LIFESPAN ─────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _client
+    _client = httpx.AsyncClient(
+        timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0),
+        limits=httpx.Limits(
+            max_connections=50,
+            max_keepalive_connections=20,
+            keepalive_expiry=30.0,
+        ),
+        follow_redirects=True,
+    )
+    try:
+        yield
+    finally:
+        await _client.aclose()
+        _client = None
+
+app = FastAPI(
+    title="MovieBox API Pro",
+    description="Full Pure REST API for moviebox.ph — Zero Scraping",
+    version=API_VERSION,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+def _require_client() -> httpx.AsyncClient:
+    if _client is None:
+        raise HTTPException(status_code=503, detail="Server initializing, retry shortly")
+    return _client
+
 async def _get_bearer_token() -> str:
-    """Auto-acquire a guest JWT from the x-user response header."""
-    global _bearer_token
+    global _bearer_token, _token_acquired_at
     if _bearer_token:
         return _bearer_token
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        resp = await client.get(f"{API_BASE}/home?host=moviebox.ph", headers=DEFAULT_HEADERS)
-        x_user = resp.headers.get("x-user")
-        if x_user:
-            try:
-                _bearer_token = json.loads(x_user).get("token")
-            except json.JSONDecodeError:
-                _bearer_token = None
-        if not _bearer_token:
-            cookie = resp.headers.get("set-cookie", "")
-            m = re.search(r"token=([^;]+)", cookie)
-            if m:
-                _bearer_token = m.group(1)
+    async with _token_lock:
+        if _bearer_token:
+            return _bearer_token
+        client = _require_client()
+        try:
+            resp = await client.get(f"{API_BASE}/home?host=moviebox.ph", headers=DEFAULT_HEADERS)
+            x_user = resp.headers.get("x-user")
+            if x_user:
+                try:
+                    _bearer_token = json.loads(x_user).get("token")
+                except json.JSONDecodeError:
+                    _bearer_token = None
+            if not _bearer_token:
+                cookie = resp.headers.get("set-cookie", "")
+                m = re.search(r"token=([^;]+)", cookie)
+                if m:
+                    _bearer_token = m.group(1)
+            if _bearer_token:
+                _token_acquired_at = time.time()
+        except Exception:
+            _bearer_token = None
     return _bearer_token or ""
 
 async def _make_request(
@@ -85,39 +154,65 @@ async def _make_request(
     payload: dict | None = None,
     custom_headers: dict | None = None,
 ) -> dict:
-    global _bearer_token
+    global _bearer_token, _token_acquired_at
+    client = _require_client()
     token = await _get_bearer_token()
-    headers = {
-        **DEFAULT_HEADERS,
-        "Authorization": f"Bearer {token}" if token else "",
-        **(custom_headers or {}),
-    }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
+    headers = {**DEFAULT_HEADERS, **(custom_headers or {})}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    last_exc: Exception | None = None
+    for attempt in range(RETRY_ATTEMPTS):
         try:
             if method == "POST":
                 resp = await client.post(url, headers=headers, json=payload)
             else:
                 resp = await client.get(url, headers=headers)
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
+            last_exc = e
+            if attempt < RETRY_ATTEMPTS - 1:
+                await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
+                continue
+            raise HTTPException(status_code=502, detail=f"Request failed after {RETRY_ATTEMPTS} attempts: {e}")
 
-            x_user = resp.headers.get("x-user")
-            if x_user:
-                try:
-                    new_token = json.loads(x_user).get("token")
-                    if new_token:
-                        _bearer_token = new_token
-                except json.JSONDecodeError:
-                    pass
+        x_user = resp.headers.get("x-user")
+        if x_user:
+            try:
+                new_token = json.loads(x_user).get("token")
+                if new_token and new_token != _bearer_token:
+                    _bearer_token = new_token
+                    _token_acquired_at = time.time()
+                    headers["Authorization"] = f"Bearer {new_token}"
+            except json.JSONDecodeError:
+                pass
 
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Upstream API error: {resp.status_code}",
-                )
+        if resp.status_code == 401 and attempt == 0:
+            _bearer_token = None
+            _token_acquired_at = 0.0
+            token = await _get_bearer_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            continue
+
+        if resp.status_code == 429 and attempt < RETRY_ATTEMPTS - 1:
+            retry_after = resp.headers.get("retry-after")
+            delay = float(retry_after) if retry_after and retry_after.isdigit() else RETRY_BACKOFF * (2 ** attempt)
+            await asyncio.sleep(delay)
+            continue
+
+        if resp.status_code in (500, 502, 503, 504) and attempt < RETRY_ATTEMPTS - 1:
+            await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
+            continue
+
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Upstream API error: {resp.status_code}")
+
+        try:
             return resp.json()
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Request failed: {e}")
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=502, detail="Upstream returned non-JSON")
+
+    raise HTTPException(status_code=502, detail=f"Request failed: {last_exc}")
 
 async def _get_player_domain() -> str:
     now = time.time()
@@ -135,48 +230,140 @@ def _build_player_referer(domain: str, detail_path: str, subject_id: str, se: in
         f"?id={subject_id}&type=/movie/detail&detailSe={se}&detailEp={ep}&lang=en"
     )
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    return HTMLResponse(content=DASHBOARD_HTML)
+async def _resolve_stream(subject_id: str, detail_path: str, se: int, ep: int) -> dict:
+    domain = await _get_player_domain()
+    referer = _build_player_referer(domain, detail_path, subject_id, se, ep)
+    play_url = (
+        f"{domain}/wefeed-h5api-bff/subject/play"
+        f"?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
+    )
+    client = _require_client()
+    resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": referer})
+    try:
+        data = resp.json().get("data", {}) or {}
+    except Exception:
+        raise HTTPException(status_code=502, detail="Player returned non-JSON")
+    return {"domain": domain, "referer": referer, "data": data}
 
-# ─── DISCOVERY ────────────────────────────────────────────────────────────────
+async def _resolve_captions(subject_id: str, detail_path: str, se: int, ep: int) -> list:
+    stream = await _resolve_stream(subject_id, detail_path, se, ep)
+    data = stream["data"]
+    streams = data.get("streams") or []
+    dash = data.get("dash") or []
 
-@app.get("/home")
-async def get_home():
-    url = f"{API_BASE}/home?host=moviebox.ph"
-    data = await _make_request(url)
-    sections = []
-    for op in data.get("data", {}).get("operatingList", []) or []:
+    stream_id = None
+    stream_format = None
+    if streams:
+        stream_id = streams[0].get("id")
+        stream_format = streams[0].get("format", "MP4")
+    elif dash:
+        stream_id = dash[0].get("id")
+        stream_format = dash[0].get("format", "DASH")
+
+    if not stream_id:
+        return []
+
+    cap_url = (
+        f"{API_BASE}/subject/caption"
+        f"?format={stream_format}&id={stream_id}"
+        f"&subjectId={subject_id}&detailPath={detail_path}"
+    )
+    data = await _make_request(cap_url)
+    inner = data.get("data", {}) or {}
+    return inner.get("captions", []) if isinstance(inner, dict) else inner
+
+def _normalize_banner_item(item: dict) -> dict | None:
+    subject = item.get("subject") or {}
+    title = item.get("title") or subject.get("title")
+    if not title or "Communities" in title:
+        return None
+    return {
+        "name": title,
+        "poster_url": (item.get("image") or {}).get("url") or (subject.get("cover") or {}).get("url"),
+        "slug": item.get("detailPath") or subject.get("detailPath"),
+        "subject_id": subject.get("subjectId"),
+        "badge": subject.get("corner"),
+    }
+
+def _normalize_subject_item(sub: dict) -> dict | None:
+    return {
+        "name": sub.get("title"),
+        "poster_url": (sub.get("cover") or {}).get("url"),
+        "slug": sub.get("detailPath"),
+        "subject_id": sub.get("subjectId"),
+        "badge": sub.get("corner"),
+        "rating": sub.get("imdbRatingValue"),
+    }
+
+_TS_RE = re.compile(r"^(\d{1,2}:\d{2}:\d{2}),(\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}),(\d{3})(.*)$")
+_INDEX_RE = re.compile(r"^\d+$")
+
+def srt_to_vtt(srt: str) -> str:
+    text = srt.replace("\r\n", "\n").replace("\r", "\n")
+    out: list[str] = ["WEBVTT", ""]
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if _INDEX_RE.match(stripped):
+            continue
+        m = _TS_RE.match(stripped)
+        if m:
+            out.append(f"{m.group(1)}.{m.group(2)} --> {m.group(3)}.{m.group(4)}{m.group(5)}")
+            continue
+        if not stripped:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        out.append(line)
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out) + "\n"
+
+def _pick_mp4_stream(streams: list, res: str) -> dict | None:
+    if not streams:
+        return None
+    if res == "best" or not res:
+        return max(streams, key=lambda s: s.get("resolutions") or 0)
+    target = res.rstrip("p")
+    for s in streams:
+        if str(s.get("resolutions")) == target:
+            return s
+    return None
+
+async def _get_home_operating_list() -> list:
+    data = await _make_request(f"{API_BASE}/home?host=moviebox.ph")
+    return data.get("data", {}).get("operatingList", []) or []
+
+async def _catalog_from_home(keywords: list[str], page: int, per_page: int = 24) -> dict | None:
+    ops = await _get_home_operating_list()
+    matched_items: list[dict] = []
+    matched_sections: set[str] = set()
+    for op in ops:
         op_type = op.get("type")
-        title = op.get("title", "Featured")
-        if op_type == "BANNER":
-            items = [
-                {
-                    "name": item.get("title") or (item.get("subject") or {}).get("title"),
-                    "poster_url": (item.get("image") or {}).get("url")
-                        or ((item.get("subject") or {}).get("cover") or {}).get("url"),
-                    "slug": item.get("detailPath") or (item.get("subject") or {}).get("detailPath"),
-                    "subject_id": (item.get("subject") or {}).get("subjectId"),
-                    "badge": (item.get("subject") or {}).get("corner"),
-                }
-                for item in op.get("banner", {}).get("items", [])
-                if item.get("title") and "Communities" not in (item.get("title") or "")
-            ]
-            sections.append({"section": "Banner", "count": len(items), "items": items})
-        elif op_type in ("SUBJECTS_MOVIE", "SUBJECTS_TV", "SUBJECTS_ANIMATION"):
-            items = [
-                {
-                    "name": sub.get("title"),
-                    "poster_url": (sub.get("cover") or {}).get("url"),
-                    "slug": sub.get("detailPath"),
-                    "subject_id": sub.get("subjectId"),
-                    "badge": sub.get("corner"),
-                    "rating": sub.get("imdbRatingValue"),
-                }
-                for sub in op.get("subjects", [])
-            ]
-            sections.append({"section": title, "count": len(items), "items": items})
-    return {"status": "success", "sections": sections}
+        title = op.get("title", "")
+        if not any(kw.lower() in title.lower() for kw in keywords):
+            continue
+        if op_type not in ("SUBJECTS_MOVIE", "SUBJECTS_TV", "SUBJECTS_ANIMATION"):
+            continue
+        matched_sections.add(title)
+        for raw in op.get("subjects", []) or []:
+            item = _normalize_subject_item(raw)
+            if item and item.get("subject_id"):
+                matched_items.append(item)
+    if not matched_items:
+        return None
+    start = (page - 1) * per_page
+    paged = matched_items[start:start + per_page]
+    return {
+        "page": page,
+        "per_page": per_page,
+        "total": len(matched_items),
+        "total_sentinel": False,
+        "source": "home_fallback",
+        "sections": sorted(matched_sections),
+        "items": paged,
+    }
+
+# ─── CATALOG ──────────────────────────────────────────────────────────────────
 
 async def _get_category_data(
     tab_id: int,
@@ -214,37 +401,235 @@ async def _get_category_data(
     ]
     pager = inner.get("pager", {}) or {}
     total = pager.get("totalCount") or inner.get("total") or len(items)
-    return {"page": page, "per_page": per_page, "total": total, "items": items}
+    sentinel = bool(total and total >= 1000000)
+    return {
+        "tab_id": tab_id,
+        "page": page,
+        "per_page": per_page,
+        "total": None if sentinel else total,
+        "total_sentinel": sentinel,
+        "source": "filter",
+        "items": items,
+    }
+
+async def _catalog(
+    kind: str,
+    tab_id: int,
+    page: int,
+    sort: str,
+    source: str,
+) -> dict:
+    if source in ("auto", "filter"):
+        result = await _get_category_data(tab_id, page=page, sort=sort)
+        if not result["total_sentinel"] or source == "filter":
+            return result
+    fallback = await _catalog_from_home(CATALOG_SECTIONS[kind], page=page)
+    if fallback:
+        return fallback
+    result = await _get_category_data(tab_id, page=page, sort=sort)
+    result["source"] = "filter_sentinel_no_fallback"
+    result["note"] = (
+        f"No home sections matched for '{kind}'. "
+        f"Try /sections to list available sections, or /browse/{{section}} directly."
+    )
+    return result
 
 @app.get("/movies")
-async def get_movies(page: int = 1, sort: str = "RECOMMEND"):
-    return await _get_category_data(tab_id=2, page=page, sort=sort)
+async def get_movies(
+    page: int = 1,
+    sort: str = "RECOMMEND",
+    tab: int | None = None,
+    source: str = "auto",
+):
+    return await _catalog(
+        "movies",
+        tab_id=tab if tab is not None else TAB_MOVIES,
+        page=page, sort=sort, source=source,
+    )
 
 @app.get("/tv-series")
-async def get_tv_series(page: int = 1, sort: str = "RECOMMEND"):
-    return await _get_category_data(tab_id=5, page=page, sort=sort)
+async def get_tv_series(
+    page: int = 1,
+    sort: str = "RECOMMEND",
+    tab: int | None = None,
+    source: str = "auto",
+):
+    return await _catalog(
+        "tv-series",
+        tab_id=tab if tab is not None else TAB_TV,
+        page=page, sort=sort, source=source,
+    )
 
 @app.get("/animation")
-async def get_animation(page: int = 1, sort: str = "RECOMMEND"):
-    return await _get_category_data(tab_id=8, page=page, sort=sort)
+async def get_animation(
+    page: int = 1,
+    sort: str = "RECOMMEND",
+    tab: int | None = None,
+    source: str = "auto",
+):
+    return await _catalog(
+        "animation",
+        tab_id=tab if tab is not None else TAB_ANIMATION,
+        page=page, sort=sort, source=source,
+    )
+
+@app.get("/sections")
+async def list_sections():
+    ops = await _get_home_operating_list()
+    out = []
+    for op in ops:
+        op_type = op.get("type")
+        title = op.get("title", "Featured")
+        if op_type == "BANNER":
+            count = len(op.get("banner", {}).get("items", []) or [])
+        elif op_type in ("SUBJECTS_MOVIE", "SUBJECTS_TV", "SUBJECTS_ANIMATION"):
+            count = len(op.get("subjects", []) or [])
+        else:
+            count = 0
+        out.append({"section": title, "type": op_type, "count": count})
+    return {"sections": out}
+
+@app.get("/browse/{section}")
+async def browse_section(section: str, page: int = 1, per_page: int = 24):
+    ops = await _get_home_operating_list()
+    matched: list[dict] = []
+    matched_titles: set[str] = set()
+    for op in ops:
+        op_type = op.get("type")
+        title = op.get("title", "")
+        if section.lower() not in title.lower():
+            continue
+        if op_type not in ("SUBJECTS_MOVIE", "SUBJECTS_TV", "SUBJECTS_ANIMATION"):
+            continue
+        matched_titles.add(title)
+        for raw in op.get("subjects", []) or []:
+            item = _normalize_subject_item(raw)
+            if item and item.get("subject_id"):
+                matched.append(item)
+    if not matched:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No section matching: {section!r}. Try /sections to list available.",
+        )
+    start = (page - 1) * per_page
+    paged = matched[start:start + per_page]
+    return {
+        "section": section,
+        "matched_titles": sorted(matched_titles),
+        "page": page,
+        "per_page": per_page,
+        "total": len(matched),
+        "items": paged,
+    }
+
+# ─── DASHBOARD ────────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return HTMLResponse(content=DASHBOARD_HTML)
+
+# ─── HOME ─────────────────────────────────────────────────────────────────────
+
+@app.get("/home")
+async def get_home():
+    ops = await _get_home_operating_list()
+    sections = []
+    for op in ops:
+        op_type = op.get("type")
+        title = op.get("title", "Featured")
+        if op_type == "BANNER":
+            items = [
+                n for n in (
+                    _normalize_banner_item(i)
+                    for i in op.get("banner", {}).get("items", []) or []
+                ) if n
+            ]
+            sections.append({"section": "Banner", "count": len(items), "items": items})
+        elif op_type in ("SUBJECTS_MOVIE", "SUBJECTS_TV", "SUBJECTS_ANIMATION"):
+            items = [
+                n for n in (
+                    _normalize_subject_item(s)
+                    for s in op.get("subjects", []) or []
+                ) if n
+            ]
+            sections.append({"section": title, "count": len(items), "items": items})
+    return {"status": "success", "sections": sections}
+
+@app.get("/home/all")
+async def get_home_aggregate(dedupe: bool = True):
+    ops = await _get_home_operating_list()
+    items: list[dict] = []
+    seen: set[str] = set()
+    for op in ops:
+        op_type = op.get("type")
+        if op_type == "BANNER":
+            for raw in op.get("banner", {}).get("items", []) or []:
+                norm = _normalize_banner_item(raw)
+                if not norm or not norm.get("subject_id"):
+                    continue
+                if dedupe and norm["subject_id"] in seen:
+                    continue
+                seen.add(norm["subject_id"])
+                items.append(norm)
+        elif op_type in ("SUBJECTS_MOVIE", "SUBJECTS_TV", "SUBJECTS_ANIMATION"):
+            for raw in op.get("subjects", []) or []:
+                norm = _normalize_subject_item(raw)
+                if not norm or not norm.get("subject_id"):
+                    continue
+                if dedupe and norm["subject_id"] in seen:
+                    continue
+                seen.add(norm["subject_id"])
+                items.append(norm)
+    return {"count": len(items), "items": items}
 
 # ─── SEARCH ───────────────────────────────────────────────────────────────────
 
 @app.get("/search/suggest")
-async def get_search_suggestions(q: str = Query(..., min_length=1)):
+async def get_search_suggestions(
+    q: str = Query(..., min_length=1),
+    enrich: bool = False,
+):
     url = f"{API_BASE}/subject/search-suggest"
     data = await _make_request(url, method="POST", payload={"keyword": q, "perPage": 10})
     inner = data.get("data", {}) or {}
     raw = inner.get("items") or inner.get("list") or []
-    suggestions = []
+    titles: list[str] = []
     for item in raw:
-        sub = item.get("subject") or {}
-        suggestions.append({
-            "title": sub.get("title") or item.get("word") or item.get("title"),
-            "slug": sub.get("detailPath") or item.get("detailPath"),
-            "subject_id": sub.get("subjectId") or item.get("subjectId"),
-        })
-    return {"suggestions": suggestions}
+        title = (
+            (item.get("subject") or {}).get("title")
+            or item.get("word")
+            or item.get("title")
+            or item.get("keyword")
+        )
+        if title and title not in titles:
+            titles.append(title)
+
+    if enrich:
+        suggestions = await asyncio.gather(*(_enrich_suggestion(t) for t in titles))
+    else:
+        suggestions = [{"title": t} for t in titles]
+
+    return {"query": q, "count": len(suggestions), "suggestions": suggestions}
+
+async def _enrich_suggestion(title: str) -> dict:
+    try:
+        data = await _make_request(
+            f"{API_BASE}/subject/search",
+            method="POST",
+            payload={"keyword": title, "page": 1, "perPage": 1},
+        )
+        inner = data.get("data", {}) or {}
+        raw = inner.get("items") or inner.get("list") or []
+        if raw:
+            sub = raw[0]
+            return {
+                "title": sub.get("title") or title,
+                "slug": sub.get("detailPath"),
+                "subject_id": sub.get("subjectId"),
+            }
+    except Exception:
+        pass
+    return {"title": title, "slug": None, "subject_id": None}
 
 @app.get("/search")
 async def search(q: str = Query(..., min_length=1), page: int = 1):
@@ -265,12 +650,9 @@ async def search(q: str = Query(..., min_length=1), page: int = 1):
     total = pager.get("totalCount") or inner.get("total") or len(items)
     return {"query": q, "page": page, "total": total, "items": items}
 
-# ─── DETAIL ───────────────────────────────────────────────────────────────────
-
 @app.get("/detail/{slug}")
 async def get_movie_detail(slug: str):
-    url = f"{API_BASE}/detail?detailPath={slug}"
-    return await _make_request(url)
+    return await _make_request(f"{API_BASE}/detail?detailPath={slug}")
 
 # ─── STREAM ───────────────────────────────────────────────────────────────────
 
@@ -281,19 +663,8 @@ async def get_stream_sources(
     se: int = 1,
     ep: int = 1,
 ):
-    domain = await _get_player_domain()
-    referer = _build_player_referer(domain, detail_path, subject_id, se, ep)
-    play_url = (
-        f"{domain}/wefeed-h5api-bff/subject/play"
-        f"?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
-    )
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": referer})
-        try:
-            data = resp.json().get("data", {}) or {}
-        except Exception:
-            raise HTTPException(status_code=502, detail="Player returned non-JSON")
-
+    stream = await _resolve_stream(subject_id, detail_path, se, ep)
+    data = stream["data"]
     has_resource = data.get("hasResource", False)
     streams = [
         {
@@ -304,7 +675,7 @@ async def get_stream_sources(
             "duration": s.get("duration"),
             "codec": s.get("codecName"),
         }
-        for s in data.get("streams", [])
+        for s in data.get("streams", []) or []
     ]
     return {
         "subject_id": subject_id,
@@ -312,8 +683,8 @@ async def get_stream_sources(
         "ep": ep,
         "has_resource": has_resource,
         "sources": streams,
-        "hls": data.get("hls", []),
-        "dash": data.get("dash", []),
+        "hls": data.get("hls", []) or [],
+        "dash": data.get("dash", []) or [],
         "free_episodes": data.get("freeNum"),
         "limited": data.get("limited", False),
         "note": None if has_resource else "No stream found for this episode.",
@@ -326,42 +697,7 @@ async def get_captions(
     se: int = 1,
     ep: int = 1,
 ):
-    domain = await _get_player_domain()
-    referer = _build_player_referer(domain, detail_path, subject_id, se, ep)
-    play_url = (
-        f"{domain}/wefeed-h5api-bff/subject/play"
-        f"?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
-    )
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        play_resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": referer})
-        try:
-            play_data = play_resp.json().get("data", {}) or {}
-        except Exception:
-            raise HTTPException(status_code=502, detail="Player returned non-JSON")
-
-    streams = play_data.get("streams") or []
-    dash = play_data.get("dash") or []
-
-    stream_id = None
-    stream_format = None
-    if streams:
-        stream_id = streams[0].get("id")
-        stream_format = streams[0].get("format", "MP4")
-    elif dash:
-        stream_id = dash[0].get("id")
-        stream_format = dash[0].get("format", "DASH")
-
-    if not stream_id:
-        return {"subject_id": subject_id, "se": se, "ep": ep, "count": 0, "captions": []}
-
-    cap_url = (
-        f"{API_BASE}/subject/caption"
-        f"?format={stream_format}&id={stream_id}"
-        f"&subjectId={subject_id}&detailPath={detail_path}"
-    )
-    data = await _make_request(cap_url)
-    inner = data.get("data", {}) or {}
-    captions = inner.get("captions", []) if isinstance(inner, dict) else inner
+    captions = await _resolve_captions(subject_id, detail_path, se, ep)
     return {
         "subject_id": subject_id,
         "se": se,
@@ -370,15 +706,178 @@ async def get_captions(
         "captions": captions,
     }
 
-# ─── HEALTH ───────────────────────────────────────────────────────────────────
+@app.get("/api/stream/{subject_id}/proxy")
+async def proxy_stream(
+    subject_id: str,
+    request: Request,
+    detail_path: str,
+    se: int = 1,
+    ep: int = 1,
+    res: str = "best",
+):
+    stream = await _resolve_stream(subject_id, detail_path, se, ep)
+    data = stream["data"]
+    stream_list = data.get("streams") or []
+    picked = _pick_mp4_stream(stream_list, res)
+    if not picked:
+        raise HTTPException(
+            status_code=502,
+            detail=f"No MP4 source for res={res}. Try /api/stream for HLS/DASH manifests.",
+        )
+
+    stream_url = picked.get("url")
+    if not stream_url:
+        raise HTTPException(status_code=502, detail="Selected source has no URL")
+
+    req_headers = {**PLAYER_HEADERS, "Referer": stream["referer"]}
+    range_header = request.headers.get("range")
+    if range_header:
+        req_headers["Range"] = range_header
+
+    client = _require_client()
+    upstream_req = client.build_request("GET", stream_url, headers=req_headers)
+    upstream = await client.send(upstream_req, stream=True)
+
+    if upstream.status_code >= 400:
+        await upstream.aclose()
+        raise HTTPException(status_code=502, detail=f"Upstream stream error: {upstream.status_code}")
+
+    async def body_iter():
+        try:
+            async for chunk in upstream.aiter_bytes(64 * 1024):
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    fwd_headers = {}
+    for h in ("content-length", "content-type", "accept-ranges", "content-range", "etag", "last-modified"):
+        if h in upstream.headers:
+            fwd_headers[h] = upstream.headers[h]
+
+    return StreamingResponse(
+        body_iter(),
+        status_code=upstream.status_code,
+        headers=fwd_headers,
+        media_type=upstream.headers.get("content-type", "video/mp4"),
+    )
+
+@app.get("/api/stream/{subject_id}/subtitles/{lang}")
+async def get_subtitles_vtt(
+    subject_id: str,
+    lang: str,
+    detail_path: str,
+    se: int = 1,
+    ep: int = 1,
+):
+    captions = await _resolve_captions(subject_id, detail_path, se, ep)
+    match = next((c for c in captions if (c.get("lan") or "").lower() == lang.lower()), None)
+    if not match:
+        raise HTTPException(status_code=404, detail=f"No caption for language: {lang}")
+
+    srt_url = match.get("url")
+    if not srt_url or not srt_url.startswith("https://"):
+        raise HTTPException(status_code=502, detail="Invalid caption URL")
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+        r = await c.get(srt_url)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Caption fetch failed: {r.status_code}")
+
+    vtt = srt_to_vtt(r.text)
+    return Response(
+        content=vtt,
+        media_type="text/vtt",
+        headers={"Content-Disposition": f'inline; filename="{lang}.vtt"'},
+    )
+
+# ─── DIAGNOSTICS ──────────────────────────────────────────────────────────────
+
+def _tab_probe(tab_id: int, per_page: int, variant_body: dict | None) -> dict:
+    payload = {"tabId": tab_id, "page": 1, "perPage": per_page}
+    if variant_body is not None:
+        payload.update(variant_body)
+    return payload
+
+@app.get("/api/tabs")
+async def discover_tabs(min_id: int = 1, max_id: int = 20, per_page: int = 3):
+    results = []
+    for tab_id in range(min_id, max_id + 1):
+        try:
+            payload = _tab_probe(tab_id, per_page, TAB_PAYLOAD_VARIANTS["baseline"])
+            data = await _make_request(f"{API_BASE}/subject/filter", method="POST", payload=payload)
+            inner = data.get("data", {}) or {}
+            raw = inner.get("items") or inner.get("subjects") or []
+            pager = inner.get("pager") or {}
+            results.append({
+                "tab_id": tab_id,
+                "count": len(raw),
+                "pager_total": pager.get("totalCount"),
+                "sentinel": bool((pager.get("totalCount") or 0) >= 1000000),
+                "sample_titles": [s.get("title") for s in raw if s.get("title")][:3],
+            })
+        except Exception as e:
+            results.append({"tab_id": tab_id, "error": str(e)})
+    return {"variant": "baseline", "results": results}
+
+@app.get("/api/tabs/variants")
+async def discover_tab_variants(tab_id: int = 2, per_page: int = 3):
+    out = []
+    for name, body in TAB_PAYLOAD_VARIANTS.items():
+        try:
+            payload = _tab_probe(tab_id, per_page, body)
+            data = await _make_request(f"{API_BASE}/subject/filter", method="POST", payload=payload)
+            inner = data.get("data", {}) or {}
+            raw = inner.get("items") or inner.get("subjects") or []
+            pager = inner.get("pager") or {}
+            total = pager.get("totalCount")
+            out.append({
+                "variant": name,
+                "payload": body,
+                "count": len(raw),
+                "pager_total": total,
+                "sentinel": bool((total or 0) >= 1000000),
+                "sample_titles": [s.get("title") for s in raw if s.get("title")][:3],
+            })
+        except Exception as e:
+            out.append({"variant": name, "error": str(e)})
+    breaking = [v for v in out if not v.get("sentinel") and not v.get("error")]
+    return {
+        "tab_id": tab_id,
+        "variants": out,
+        "non_sentinel_variants": [v["variant"] for v in breaking],
+        "hint": (
+            "If non_sentinel_variants is non-empty, that payload shape works."
+        ) if breaking else (
+            "All variants sentinel. /subject/filter requires auth we don't have as a guest. "
+            "Catalogs fall back to /home sections automatically — use those."
+        ),
+    }
+
+@app.get("/api/debug/upstream")
+async def debug_upstream(
+    path: str,
+    method: str = "GET",
+    payload: str | None = None,
+):
+    if not path.startswith("/"):
+        path = "/" + path
+    body = json.loads(payload) if payload else None
+    return await _make_request(f"{API_BASE}{path}", method=method, payload=body)
 
 @app.get("/health")
 async def health():
+    token_age = int(time.time() - _token_acquired_at) if _token_acquired_at else None
+    pool = _client._transport._pool if _client is not None else None
     return {
         "status": "ok",
+        "version": API_VERSION,
         "token_cached": bool(_bearer_token),
+        "token_age_seconds": token_age,
         "domain_cached": _domain_cache["value"],
         "domain_expires_in": max(0, int(_domain_cache["expires"] - time.time())),
+        "client_pool_connections": len(pool.connections) if pool is not None else None,
+        "tabs": {"movies": TAB_MOVIES, "tv": TAB_TV, "animation": TAB_ANIMATION},
+        "catalog_sections": CATALOG_SECTIONS,
     }
 
 # ─── DASHBOARD HTML ───────────────────────────────────────────────────────────
@@ -394,7 +893,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 :root{--primary:#ff3d71;--secondary:#3366ff;--accent:#00f2ff;--bg:#07080c;--card-bg:rgba(255,255,255,0.03);--glass:rgba(255,255,255,0.06);--text:#fff}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden;min-height:100vh;background-image:radial-gradient(circle at 10% 10%,rgba(255,61,113,0.12) 0%,transparent 40%),radial-gradient(circle at 90% 90%,rgba(51,102,255,0.12) 0%,transparent 40%)}
-.container{max-width:1200px;margin:0 auto;padding:60px 24px}
+.container{max-width:1300px;margin:0 auto;padding:60px 24px}
 header{text-align:center;margin-bottom:80px;animation:fadeInDown 1s ease-out}
 @keyframes fadeInDown{from{opacity:0;transform:translateY(-30px)}to{opacity:1;transform:translateY(0)}}
 h1{font-size:clamp(2.5rem,8vw,4rem);font-weight:800;background:linear-gradient(135deg,#fff 0%,#aaa 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:15px;letter-spacing:-2px}
@@ -405,7 +904,7 @@ h1{font-size:clamp(2.5rem,8vw,4rem);font-weight:800;background:linear-gradient(1
 .card-title{font-size:1.5rem;font-weight:700;margin-bottom:18px;display:flex;align-items:center;gap:12px}
 .card-title i{width:32px;height:32px;background:rgba(255,255,255,0.05);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1rem;color:var(--accent);font-style:normal}
 .card-desc{color:#9ea3ac;font-size:1rem;line-height:1.6;margin-bottom:25px;flex-grow:1}
-.endpoint{font-family:'JetBrains Mono',monospace;background:rgba(0,0,0,.4);padding:14px;border-radius:14px;font-size:.85rem;color:var(--accent);border:1px solid rgba(0,242,255,.15);margin-bottom:25px;word-break:break-all;position:relative}
+.endpoint{font-family:'JetBrains Mono',monospace;background:rgba(0,0,0,.4);padding:14px;border-radius:14px;font-size:.8rem;color:var(--accent);border:1px solid rgba(0,242,255,.15);margin-bottom:25px;word-break:break-all;position:relative}
 .endpoint::after{content:'GET';position:absolute;right:14px;top:14px;font-size:.65rem;font-weight:800;color:rgba(255,255,255,.3)}
 .btn{display:flex;align-items:center;justify-content:center;padding:16px;background:#fff;color:#000;text-decoration:none;border-radius:16px;font-weight:700;font-size:.95rem;transition:all .3s}
 .btn:hover{background:var(--primary);color:#fff;transform:translateY(-2px);box-shadow:0 10px 25px rgba(255,61,113,.4)}
@@ -413,32 +912,41 @@ footer{text-align:center;padding:80px 0 40px;animation:fadeIn 2s ease}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 .dev-tag{font-weight:800;color:#666;letter-spacing:3px;text-transform:uppercase;font-size:.75rem;border:1px solid #222;padding:12px 30px;border-radius:50px;display:inline-block;background:rgba(255,255,255,.01);transition:all .3s}
 .dev-tag:hover{color:var(--text);border-color:var(--primary);letter-spacing:5px}
+.tag-new{background:var(--accent);color:#000;font-size:.6rem;font-weight:800;padding:3px 8px;border-radius:6px;letter-spacing:1px;margin-left:6px;vertical-align:middle}
 @media(max-width:480px){.container{padding:40px 16px}.card{padding:25px}h1{margin-bottom:10px}}
 </style>
 </head>
 <body>
 <div class="container">
 <header>
-<div class="badge">Enterprise API Solution</div>
+<div class="badge">v2.3.3 &middot; Pro API</div>
 <h1>MovieBox Pro</h1>
 <p style="color:#667;font-size:1.25rem;font-weight:300">State-of-the-Art Pure API Architecture</p>
 </header>
 <div class="grid">
-<div class="card"><div class="card-title"><i>🏠</i> Discover Home</div><p class="card-desc">The ultimate window into MovieBox. Headlines, recommended content, and trending blocks updated in real-time.</p><div class="endpoint">/home</div><a href="/home" target="_blank" class="btn">Launch API</a></div>
-<div class="card"><div class="card-title"><i>🔍</i> Smart Search</div><p class="card-desc">High-precision search engine results. Returns titles, posters, and slugs for lightning-fast matching.</p><div class="endpoint">/search?q=Attack on Titan</div><a href="/search?q=Attack on Titan" target="_blank" class="btn">Test Search</a></div>
-<div class="card"><div class="card-title"><i>🆔</i> Metadata A-Z</div><p class="card-desc">Deep-dive into any subject. Episodes, seasons, languages, and full high-resolution metadata trees.</p><div class="endpoint">/detail/{slug}</div><a href="/detail/attack-on-titan-hindi-kGWQOIx0d4" target="_blank" class="btn">Fetch Specs</a></div>
-<div class="card"><div class="card-title"><i>🎬</i> Stream Engine</div><p class="card-desc">Dynamic domain discovery and direct MP4 extraction. Supports multiple resolutions and qualities.</p><div class="endpoint">/api/stream/{subject_id}</div><a href="/api/stream/56988683026712168?detail_path=attack-on-titan-hindi-kGWQOIx0d4" target="_blank" class="btn">Get Player Link</a></div>
-<div class="card"><div class="card-title"><i>📦</i> Catalog Filters</div><p class="card-desc">Paginated collections for all genres. Movies, TV shows, and Animations filtered by professional criteria.</p><div class="endpoint">/tv-series?page=2</div><a href="/tv-series?page=2" target="_blank" class="btn">Test Page 2</a></div>
-<div class="card"><div class="card-title"><i>💬</i> Subtitle Suite</div><p class="card-desc">Access to the complete SRT/VTT global database for all streaming subjects.</p><div class="endpoint">/api/stream/{id}/captions</div><a href="/api/stream/6207982430134357800/captions?detail_path=breaking-bad-ej6Bp0MCAo7" target="_blank" class="btn">Retrieve Subs</a></div>
-<div class="card"><div class="card-title"><i>❤️</i> Health</div><p class="card-desc">Service liveness. Token cache state and player-domain TTL.</p><div class="endpoint">/health</div><a href="/health" target="_blank" class="btn">Check</a></div>
+<div class="card"><div class="card-title"><i>🏠</i> Discover Home</div><p class="card-desc">Headlines, recommended content, and trending blocks. Grouped by section.</p><div class="endpoint">/home</div><a href="/home" target="_blank" class="btn">Launch API</a></div>
+<div class="card"><div class="card-title"><i>📚</i> Aggregate Feed</div><p class="card-desc">Every section flattened into one deduped feed.</p><div class="endpoint">/home/all</div><a href="/home/all" target="_blank" class="btn">Get Feed</a></div>
+<div class="card"><div class="card-title"><i>🧩</i> Sections</div><p class="card-desc">List every home section with type + item count.</p><div class="endpoint">/sections</div><a href="/sections" target="_blank" class="btn">List</a></div>
+<div class="card"><div class="card-title"><i>🗂️</i> Browse Section</div><p class="card-desc">Direct access to any home section. URL-encode spaces: <code>/browse/Top%20Anime</code>.</p><div class="endpoint">/browse/Cinema</div><a href="/browse/Cinema" target="_blank" class="btn">Open</a></div>
+<div class="card"><div class="card-title"><i>🎬</i> Movies</div><p class="card-desc">Home-section fallback: Cinema, Bollywood, Hollywood, South Indian.</p><div class="endpoint">/movies</div><a href="/movies" target="_blank" class="btn">Open</a></div>
+<div class="card"><div class="card-title"><i>📺</i> TV Series</div><p class="card-desc">Home-section fallback: Hot Short TV, Indian Drama, Western TV, Best Asian Series.</p><div class="endpoint">/tv-series</div><a href="/tv-series" target="_blank" class="btn">Open</a></div>
+<div class="card"><div class="card-title"><i>🌸</i> Animation</div><p class="card-desc">Home-section fallback: Top Anime.</p><div class="endpoint">/animation</div><a href="/animation" target="_blank" class="btn">Open</a></div>
+<div class="card"><div class="card-title"><i>🔍</i> Search</div><p class="card-desc">Full-text search. Returns titles, posters, and slugs.</p><div class="endpoint">/search?q=matrix</div><a href="/search?q=matrix" target="_blank" class="btn">Search</a></div>
+<div class="card"><div class="card-title"><i>💡</i> Suggest</div><p class="card-desc">Typeahead. Lean by default. <code>?enrich=true</code> fills slug + sid.</p><div class="endpoint">/search/suggest?q=break</div><a href="/search/suggest?q=break" target="_blank" class="btn">Try</a></div>
+<div class="card"><div class="card-title"><i>🆔</i> Detail</div><p class="card-desc">Full metadata tree for any subject.</p><div class="endpoint">/detail/{slug}</div><a href="/detail/attack-on-titan-hindi-kGWQOIx0d4" target="_blank" class="btn">Fetch</a></div>
+<div class="card"><div class="card-title"><i>🎥</i> Stream</div><p class="card-desc">Direct MP4 sources per resolution + HLS/DASH manifests.</p><div class="endpoint">/api/stream/{sid}</div><a href="/api/stream/56988683026712168?detail_path=attack-on-titan-hindi-kGWQOIx0d4" target="_blank" class="btn">Get</a></div>
+<div class="card"><div class="card-title"><i>📥</i> Stream Proxy</div><p class="card-desc">Range-aware MP4 passthrough for media servers.</p><div class="endpoint">/api/stream/{sid}/proxy</div><a href="/api/stream/56988683026712168/proxy?detail_path=attack-on-titan-hindi-kGWQOIx0d4&res=best" target="_blank" class="btn">Stream</a></div>
+<div class="card"><div class="card-title"><i>💬</i> Captions</div><p class="card-desc">Full caption track list per episode.</p><div class="endpoint">/api/stream/{sid}/captions</div><a href="/api/stream/6207982430134357800/captions?detail_path=breaking-bad-ej6Bp0MCAo7" target="_blank" class="btn">List</a></div>
+<div class="card"><div class="card-title"><i>📄</i> VTT Subtitles</div><p class="card-desc">SRT → WebVTT inline. For &lt;track&gt; elements.</p><div class="endpoint">/api/stream/{sid}/subtitles/{lang}</div><a href="/api/stream/6207982430134357800/subtitles/en?detail_path=breaking-bad-ej6Bp0MCAo7" target="_blank" class="btn">Get VTT</a></div>
+<div class="card"><div class="card-title"><i>🧪</i> Tab Discovery</div><p class="card-desc">Probe tab IDs. Diagnostic — endpoint requires auth we don't have.</p><div class="endpoint">/api/tabs</div><a href="/api/tabs" target="_blank" class="btn">Probe</a></div>
+<div class="card"><div class="card-title"><i>❤️</i> Health</div><p class="card-desc">Liveness + token cache + tab config.</p><div class="endpoint">/health</div><a href="/health" target="_blank" class="btn">Check</a></div>
 </div>
-<footer><div class="dev-tag">Developer: Walter</div></footer>
+<footer><div class="dev-tag">Developer: Faisal</div></footer>
 </div>
 </body>
 </html>"""
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
     reload_flag = os.environ.get("RELOAD", "0") == "1"
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=reload_flag)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=reload_flag)
