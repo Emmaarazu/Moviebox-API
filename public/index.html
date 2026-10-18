@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Movie App</title>
+    <style>
+        body { background-color: #111; color: white; font-family: sans-serif; padding: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 15px; }
+        .card { text-align: center; }
+        .card img { width: 100%; border-radius: 8px; }
+        .card h3 { font-size: 14px; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <h1>MovieBox Cinema</h1>
+    <div class="grid" id="movie-grid">Loading...</div>
+
+    <script>
+        fetch('https://moviebox-api-xi-ten.vercel.app/browse/Cinema')
+            .then(response => response.json())
+            .then(data => {
+                const grid = document.getElementById('movie-grid');
+                grid.innerHTML = ''; 
+
+                data.items.forEach(item => {
+                    const card = document.createElement('div');
+                    card.className = 'card';
+                    card.innerHTML = `
+                        <img src="${item.poster_url}" alt="${item.title}">
+                        <h3>${item.title}</h3>
+                    `;
+                    grid.appendChild(card);
+                });
+            })
+            .catch(error => {
+                document.getElementById('movie-grid').innerText = "Error loading data.";
+            });
+    </script>
+</body>
+</html>
